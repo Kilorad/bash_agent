@@ -13,73 +13,76 @@ sys.path.append('../llms_local')
 import chat_bot
 
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
+from selenium.webdriver import Chrome, ChromeOptions
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import NoSuchElementException
+import urllib.parse
+import time
 from urllib.parse import unquote
-import urllib
+
 
 def setup_driver():
-    chrome_options = Options()
-    #chrome_options.add_argument("--headless")  # Режим без отображения браузера
+    chrome_options = ChromeOptions()
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-    driver = webdriver.Chrome(options=chrome_options)
-    return driver
+    chrome_options.add_argument("--start-maximized")
+    return Chrome(options=chrome_options)
 
-def parse_results(driver, url):
-    driver.get(url)
-    page_source = driver.page_source.split('\n')  # Разбиваем исходный код на строки
-    
-    results = []
-    seen_urls = set()
-    
-    current_url = None
-    collect_title = False
-    title_buffer = []
-    page_source = '\n'.join([page.replace('href=', '\nhref=') for page in page_source]).split('\n')
-    
-    for line in page_source:
-        # Ищем строки с .html
-        if '.html' in line:
-            # Этап 1: Поиск URL
-            href_pos = line.find('href=')
-            if href_pos != -1:
-                url_start = line.find('url=', href_pos)
-                if url_start != -1:
-                    url_end = line.find('&', url_start)
-                    if url_end == -1:
-                        url_end = line.find('"', url_start)
-                    if url_end != -1:
-                        current_url = unquote(line[url_start+4:url_end])
+def parse_organic_item(item):
+    """Парсим элемент с объединенным заголовком и сниппетом"""
+    try:
+        content = item.find_element(By.CSS_SELECTOR, ".OrganicTextContentSpan")
+        full_text = content.text.replace('\n', ' ')
         
-        # Этап 2: Поиск заголовка
-        #<span role="text" class="OrganicTextContentSpan">Как <b>спецназ</b> прошел внутри <b>газопровода</b> под Суджей - Газета.Ru.</span>
-        if '<span role="text" class="OrganicTextContentSpan">' in line:
-            title_start = line.find('<span role="text" class="OrganicTextContentSpan">')
-            title_end = line.find('</span></div>')
-            
-            if title_end != -1:
-                title = line[title_start:title_end].strip()
-                #if title and current_url not in seen_urls:
-                results.append({'url': current_url, 'title': title.replace('<span role="text" class="OrganicTextContentSpan">', '').replace('</span></div>', '')})
-                current_url = None
+        # Разделяем текст на заголовок и сниппет
+        parts = full_text.split('. ')
+        title = parts[0] + '.' if len(parts) > 1 else full_text
+        snippet = '. '.join(parts[1:]) if len(parts) > 1 else ""
+        
+        url = item.find_element(By.CSS_SELECTOR, "a[href]").get_attribute("href")
+        
+        return {
+            'title': title,
+            'url': url.split('?')[0],
+            'snippet': snippet[:250] + '...' if len(snippet) > 250 else snippet
+        }
+        
+    except NoSuchElementException:
+        return None
+
+def smart_parse(driver):
+    results = []
+    try:
+        items = WebDriverWait(driver, 15).until(
+            EC.presence_of_all_elements_located((By.CSS_SELECTOR, "li.serp-item")))
+        
+        for item in items[:30]:
+            result = parse_organic_item(item)
+            if result and 'yandex.ru' not in result['url']:
+                results.append(result)
+                
+        return results
     
-    return results
+    except Exception as e:
+        print(f"Parse error: {str(e)}")
+        return []
 
 def ya_search(query):
-    s = 'Ничего не нашлось (не факт, что поисковик исправен)'
+    driver = setup_driver()
     try:
-        driver = setup_driver()
-        search_url = f"https://yandex.ru/search/?text={urllib.parse.quote_plus(query)}&num=20"
-        data = parse_results(driver, search_url)
-
-        s = ''
-        for idx, item in enumerate(data, 1):
-            s += f"{idx}. URL: {item['url']}"
-            s += (f"   Заголовок: {item['title']}")
-            s += "-"*5
+        url = f"https://yandex.ru/search/?text={urllib.parse.quote_plus(query)}"
+        driver.get(url)
+        time.sleep(2)  # Ожидание прогрузки JS
+        
+        # Пролистываем страницу
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2)")
+        time.sleep(1)
+        
+        return str(smart_parse(driver))
+        
     finally:
         driver.quit()
-    return s
 
 
 #Это просто мой способ коннекта к LLM, тут может быть какой-то ваш коннектор
