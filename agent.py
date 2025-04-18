@@ -137,19 +137,19 @@ class SSHTool:
 
 
 class ToolBot:
-    def __init__(self, character_prompt, character_name, instruction_prompt=None, user_name="sd", termimal_mode = 'bash', safety_check_bash=True, sshInstance=None):
+    def __init__(self, character_prompt, character_name, instruction_prompt=None, user_name="sd", termimal_mode = 'bash', safety_check_bash=True, sshInstance=None, max_tokens_in_msg=270, history_text_maxlen=4500, history_maxlen=200):
         self.llm_connector = llm_connector
         self.character_prompt = character_prompt
         self.character_name = character_name
         self.instruction_prompt = instruction_prompt
         self.user_name = user_name
-        self.history = collections.deque(maxlen=200)#[]
+        self.history = collections.deque(maxlen=history_maxlen)#[]
         self.current_mode = 'user'  # Начинаем в режиме пользователя
         self.safety_check_bash = safety_check_bash
         self.termimal_mode = termimal_mode
 
-        self.max_tokens_in_msg = 270
-        self.history_text_maxlen = 4500
+        self.max_tokens_in_msg =  max_tokens_in_msg
+        self.history_text_maxlen = history_text_maxlen
         self.sshInstance = sshInstance
         self.log = []
 
