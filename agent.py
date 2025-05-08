@@ -22,7 +22,60 @@ import urllib.parse
 import time
 from urllib.parse import unquote
 
+# ========== Глобальный конфиг ==========
+CONFIG = {
+    'MAX_RAW_HISTORY': 600,          # Последние N сообщений храним полностью
+    'SUMMARY_UPDATE_INTERVAL': 4,   # Каждые K шагов обновляем суммари
+    'MAX_SUMMARY_TOKENS': 250,      # Лимит для суммаризированной части
+    'MAX_TOKENS_IN_MSG': 270,
+    'HISTORY_TEXT_MAXLEN': 3000,
+    'HISTORY_MAXLEN': 200,
+    'TERMINAL_OUT_MAX_SIZE': 700,
+    'EXEC_TIMEOUT': 30
+}
+# =======================================
 
+class MemoryManager:
+    def __init__(self, llm_connector):
+        self.raw_buffer = collections.deque(maxlen=CONFIG['MAX_RAW_HISTORY'])
+        self.summary = ""
+        self.step_counter = 0
+        self.llm = llm_connector
+        
+    def update_summary(self, new_events_text):
+        """Обновляем суммари с помощью LLM"""
+        prompt = (
+            f"{self.character_prompt}\n"
+            f"Кратко обнови саммари диалога, сохраняя технические детали и договорённости. Текущее саммари:\n{self.summary}\n"
+            f"Новые события:\n{new_events_text}\n"
+            f"Новое суммари (максимум {CONFIG['MAX_SUMMARY_TOKENS']} символов, только факты, закончи символом '<stop>'):"
+        )
+
+        new_summary = self.llm.create_text(
+            prompt, 
+            max_tokens=CONFIG['MAX_SUMMARY_TOKENS'], 
+            temp=0.3, 
+            stop_words=['<stop>', '|'],
+            verbose=False
+        ).strip()
+        
+        # Совмещаем старое и новое суммари
+        combined = f"{self.summary}\n{new_summary}".strip()
+        self.summary = ' '.join(combined.split()[:CONFIG['MAX_SUMMARY_TOKENS']])
+        
+        # Очищаем буфер после суммаризации
+        self.raw_buffer.clear()
+        self.step_counter = 0
+        
+    def add_message(self, message):
+        """Добавляем сообщение в буфер и проверяем необходимость суммаризации"""
+        self.raw_buffer.append(message)
+        self.step_counter += 1
+        
+        if (self.step_counter >= CONFIG['SUMMARY_UPDATE_INTERVAL'] or 
+            any(tag in message for tag in ['TERMINAL:', 'SEARCH:'])):
+            self.update_summary('\n'.join(self.raw_buffer))
+            
 def setup_driver():
     chrome_options = ChromeOptions()
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
@@ -113,7 +166,7 @@ class SSHTool:
         self.client.connect(vm_ip, username=user, password=password )
         self.out_max_size = out_max_size
 
-        self.exec_timeout = 30
+        self.exec_timeout = CONFIG['EXEC_TIMEOUT']
     
     def execute(self, command: str, verbose=False) -> str:
         # Фильтрация опасных команд (например, rm, chmod, sudo)
@@ -140,21 +193,24 @@ class SSHTool:
 
 
 class ToolBot:
-    def __init__(self, character_prompt, character_name, instruction_prompt=None, user_name="sd", termimal_mode = 'bash', safety_check_bash=True, sshInstance=None, max_tokens_in_msg=270, history_text_maxlen=4500, history_maxlen=200):
+    def __init__(self, character_prompt, character_name, instruction_prompt=None, user_name="sd", termimal_mode = 'bash', safety_check_bash=True, sshInstance=None):
         self.llm_connector = llm_connector
         self.character_prompt = character_prompt
         self.character_name = character_name
         self.instruction_prompt = instruction_prompt
         self.user_name = user_name
-        self.history = collections.deque(maxlen=history_maxlen)#[]
-        self.current_mode = 'user'  # Начинаем в режиме пользователя
+        self.history = collections.deque(maxlen=CONFIG['HISTORY_MAXLEN'])
+        self.current_mode = 'user'
         self.safety_check_bash = safety_check_bash
         self.termimal_mode = termimal_mode
-
-        self.max_tokens_in_msg =  max_tokens_in_msg
-        self.history_text_maxlen = history_text_maxlen
         self.sshInstance = sshInstance
         self.log = []
+        self.memory = MemoryManager(llm_connector)  # Добавлен менеджер памяти
+        self.memory.character_prompt = self.character_prompt
+
+        self.history_text_maxlen = CONFIG['HISTORY_TEXT_MAXLEN']
+        self.max_tokens_in_msg = CONFIG['MAX_TOKENS_IN_MSG']
+        self.max_raw_history = CONFIG['MAX_RAW_HISTORY']
 
         if instruction_prompt is None:
             self.instruction_prompt = (
@@ -198,37 +254,32 @@ class ToolBot:
         return s_out
 
     def update_history(self, sender, message):
-        message = message.strip() + '\n'
-        whereto = ''
-        if self.current_mode == 'terminal':
-            whereto = " (to terminal)"
-        elif self.current_mode == 'note':
-            whereto = " (to notes)"
-        elif self.current_mode == 'search':
-            whereto = " (to search)"
-        elif self.current_mode == 'user':
-            whereto = " (to dialogue)"
-        elif self.current_mode == 'thoughts':
-            whereto = " (in thoughts)"
-        else:
-            whereto = f" (in mode: {self.current_mode})"
-        if sender != self.character_name:
-            whereto = ''
+        message = message.strip()
+        whereto = self.get_mode_suffix()
         self.history.append(f"{sender}{whereto}: {message}")
+        self.memory.add_message(f"{sender}: {message}")  # Добавляем в систему памяти
+    
+    def get_mode_suffix(self):
+        modes = {
+            'terminal': " (to terminal)",
+            'note': " (to notes)",
+            'search': " (to search)",
+            'user': " (to dialogue)",
+            'thought': " (thinking)"
+        }
+        return modes.get(self.current_mode, "")
 
     def respond(self, message, max_actions=None, verbose=True):
         self.verbose = verbose
-        if message[-1] != '\n':
-            message += '\n'
         self.update_history(self.user_name, message)
 
         self.action_counter = 0
-        while 1:
-            if max_actions is not None:
-                if self.action_counter >= max_actions:
-                    llm_answer = "Дай мне ещё время поработать над этой задачей."
-                    self.update_history(self.character_name, llm_answer)
-                    break
+        while True:
+            if max_actions and self.action_counter >= max_actions:
+                llm_answer = "Дай мне ещё время поработать над этой задачей."
+                self.update_history(self.character_name, llm_answer)
+                break
+                
             self.action_counter += 1
             #вначале мысли, потом всё остальное
             # запрашиваем у LLM мысли
@@ -236,7 +287,8 @@ class ToolBot:
             # запрашиваем у LLM
             prompt = self.generate_prompt()
             stop_words = ['<stop>']
-            llm_answer = self.llm_connector.create_text(prompt, max_tokens=self.max_tokens_in_msg, temp=0.9, stop_words=stop_words, verbose=False)
+
+            llm_answer = self.llm_connector.create_text(prompt, max_tokens=self.max_tokens_in_msg, temp=0.2, stop_words=stop_words, verbose=False)
             self.log.append([prompt,llm_answer])
             llm_answer = llm_answer.replace('<stop>', '')
             self.update_history(self.character_name, llm_answer)
@@ -309,7 +361,7 @@ class ToolBot:
         return llm_answer
 
     def generate_prompt(self):
-        history_text = "<stop>".join(self.history)
+        history_text = "<stop>\n".join(self.history)
         if len(history_text) > self.history_text_maxlen:
             history_text = history_text[-self.history_text_maxlen:]
         where_to_write = ''
@@ -332,11 +384,14 @@ class ToolBot:
         elif self.current_mode == "choose":
             where_to_write_end = ' (chosing mode)'
             where_to_write = 'Сейчас ты выбираешь режим - у тебя есть следующие варианты:\n<terminal> - перейти к командной строке\n<user> - перейти к диалогу\n<note> - перейти к записной книжке\n<search> - перейти к поисковику\n'
-        return (f"{self.instruction_prompt}\n\n"
-                f"{where_to_write}\n"
-                f"{self.character_prompt}\n"
-                f"\n\nИстория диалога:\n{history_text}\n\n\n"
-                f"{self.character_name}{where_to_write_end}:")
+        return ''.join(["Текущий контекст:",
+                self.memory.summary,
+                "\n\n",
+                f"{self.instruction_prompt}\n\n",
+                f"{where_to_write}\n",
+                f"{self.character_prompt}\n",
+                f"\n\nИстория диалога:\n{history_text}\n\n\n",
+                f"{self.character_name}{where_to_write_end}:"])
 
 
 
